@@ -202,6 +202,8 @@ static void zynq_init(MachineState *machine)
     zynq_init_spi_flashes(0xE0007000, pic[81-IRQ_OFFSET], false);
     zynq_init_spi_flashes(0xE000D000, pic[51-IRQ_OFFSET], true);
 
+    sysbus_create_simple("zynq-gpio", 0xE000A000, pic[52-IRQ_OFFSET]);
+
     sysbus_create_simple("xlnx,ps7-usb", 0xE0002000, pic[53-IRQ_OFFSET]);
     sysbus_create_simple("xlnx,ps7-usb", 0xE0003000, pic[76-IRQ_OFFSET]);
 
