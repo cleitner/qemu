@@ -7,6 +7,7 @@
  */
 #include "hw/hw.h"
 #include "hw/m68k/mcf.h"
+#include "hw/net/mcf_fec.h"
 #include "qemu/timer.h"
 #include "hw/ptimer.h"
 #include "sysemu/sysemu.h"

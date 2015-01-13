@@ -7,7 +7,7 @@
  */
 #include "hw/hw.h"
 #include "net/net.h"
-#include "hw/m68k/mcf.h"
+#include "hw/net/mcf_fec.h"
 /* For crc32 */
 #include <zlib.h>
 #include "exec/address-spaces.h"
@@ -23,12 +23,196 @@ do { printf("mcf_fec: " fmt , ## __VA_ARGS__); } while (0)
 
 #define FEC_MAX_FRAME_SIZE 2032
 
+struct PHY {
+    uint32_t regs[32];
+
+    int link;
+
+    unsigned int (*read)(struct PHY *phy, unsigned int req);
+    void (*write)(struct PHY *phy, unsigned int req,
+                  unsigned int data);
+};
+
+/* Advertisement control register. */
+#define ADVERTISE_10HALF        0x0020  /* Try for 10mbps half-duplex  */
+#define ADVERTISE_10FULL        0x0040  /* Try for 10mbps full-duplex  */
+#define ADVERTISE_100HALF       0x0080  /* Try for 100mbps half-duplex */
+#define ADVERTISE_100FULL       0x0100  /* Try for 100mbps full-duplex */
+
+static unsigned int tdk_read(struct PHY *phy, unsigned int req)
+{
+    int regnum;
+    unsigned r = 0;
+
+    regnum = req & 0x1f;
+
+    switch (regnum) {
+        case 1:
+            if (!phy->link) {
+                break;
+            }
+            /* MR1.  */
+            /* Speeds and modes.  */
+            r |= (1 << 13) | (1 << 14);
+            r |= (1 << 11) | (1 << 12);
+            r |= (1 << 5); /* Autoneg complete.  */
+            r |= (1 << 3); /* Autoneg able.  */
+            r |= (1 << 2); /* link.  */
+            r |= (1 << 1); /* link.  */
+            break;
+        case 5:
+            /* Link partner ability.
+               We are kind; always agree with whatever best mode
+               the guest advertises.  */
+            r = 1 << 14; /* Success.  */
+            /* Copy advertised modes.  */
+            r |= phy->regs[4] & (15 << 5);
+            /* Autoneg support.  */
+            r |= 1;
+            break;
+        case 17:
+            /* Marvell PHY on many xilinx boards.  */
+            r = 0x8000; /* 1000Mb  */
+            break;
+        case 18:
+            {
+                /* Diagnostics reg.  */
+                int duplex = 0;
+                int speed_100 = 0;
+
+                if (!phy->link) {
+                    break;
+                }
+
+                /* Are we advertising 100 half or 100 duplex ? */
+                speed_100 = !!(phy->regs[4] & ADVERTISE_100HALF);
+                speed_100 |= !!(phy->regs[4] & ADVERTISE_100FULL);
+
+                /* Are we advertising 10 duplex or 100 duplex ? */
+                duplex = !!(phy->regs[4] & ADVERTISE_100FULL);
+                duplex |= !!(phy->regs[4] & ADVERTISE_10FULL);
+                r = (speed_100 << 10) | (duplex << 11);
+            }
+            break;
+
+        default:
+            r = phy->regs[regnum];
+            break;
+    }
+    DPRINTF("\n%s %x = reg[%d]\n", __func__, r, regnum);
+    return r;
+}
+
+static void
+tdk_write(struct PHY *phy, unsigned int req, unsigned int data)
+{
+    int regnum;
+
+    regnum = req & 0x1f;
+    DPRINTF("%s reg[%d] = %x\n", __func__, regnum, data);
+    switch (regnum) {
+        default:
+            phy->regs[regnum] = data;
+            break;
+    }
+
+    /* Unconditionally clear regs[BMCR][BMCR_RESET] */
+    phy->regs[0] &= ~0x8000;
+}
+
+static void
+tdk_init(struct PHY *phy)
+{
+    phy->regs[0] = 0x3100;
+    /* PHY Id.  */
+    phy->regs[2] = 0x0300;
+    phy->regs[3] = 0xe400;
+    /* Autonegotiation advertisement reg.  */
+    phy->regs[4] = 0x01E1;
+    phy->link = 1;
+
+    phy->read = tdk_read;
+    phy->write = tdk_write;
+}
+
+struct MDIOBus {
+    /* bus.  */
+    int mdc;
+    int mdio;
+
+    /* decoder.  */
+    enum {
+        PREAMBLE,
+        SOF,
+        OPC,
+        ADDR,
+        REQ,
+        TURNAROUND,
+        DATA
+    } state;
+    unsigned int drive;
+
+    unsigned int cnt;
+    unsigned int addr;
+    unsigned int opc;
+    unsigned int req;
+    unsigned int data;
+
+    struct PHY *devs[32];
+};
+
+static void
+mdio_attach(struct MDIOBus *bus, struct PHY *phy, unsigned int addr)
+{
+    bus->devs[addr & 0x1f] = phy;
+}
+
+#ifdef USE_THIS_DEAD_CODE
+static void
+mdio_detach(struct MDIOBus *bus, struct PHY *phy, unsigned int addr)
+{
+    bus->devs[addr & 0x1f] = NULL;
+}
+#endif
+
+static uint16_t mdio_read_req(struct MDIOBus *bus, unsigned int addr,
+                  unsigned int reg)
+{
+    struct PHY *phy;
+    uint16_t data;
+
+    phy = bus->devs[addr];
+    if (phy && phy->read) {
+        data = phy->read(phy, reg);
+    } else {
+        data = 0xffff;
+    }
+    DPRINTF("%s addr=%d reg=%d data=%x\n", __func__, addr, reg, data);
+    return data;
+}
+
+static void mdio_write_req(struct MDIOBus *bus, unsigned int addr,
+               unsigned int reg, uint16_t data)
+{
+    struct PHY *phy;
+
+    DPRINTF("%s addr=%d reg=%d data=%x\n", __func__, addr, reg, data);
+    phy = bus->devs[addr];
+    if (phy && phy->write) {
+        phy->write(phy, reg, data);
+    }
+}
+
 typedef struct {
     MemoryRegion *sysmem;
     MemoryRegion iomem;
-    qemu_irq *irq;
+    qemu_irq *irqs;
     NICState *nic;
     NICConf conf;
+
+    struct PHY phy;
+    struct MDIOBus mdio_bus;
+
     uint32_t irq_state;
     uint32_t eir;
     uint32_t eimr;
@@ -45,7 +229,12 @@ typedef struct {
     uint32_t erdsr;
     uint32_t etdsr;
     uint32_t emrbr;
+    uint32_t miigsk_cfgr;
+    uint32_t miigsk_enr;
 } mcf_fec_state;
+
+#define FEC_MIIGSK_ENR_EN       0x00000002
+#define FEC_MIIGSK_ENR_READY    0x00000004
 
 #define FEC_INT_HB   0x80000000
 #define FEC_INT_BABR 0x40000000
@@ -108,19 +297,31 @@ typedef struct {
 
 static void mcf_fec_read_bd(mcf_fec_bd *bd, uint32_t addr)
 {
-    cpu_physical_memory_read(addr, bd, sizeof(*bd));
-    be16_to_cpus(&bd->flags);
-    be16_to_cpus(&bd->length);
-    be32_to_cpus(&bd->data);
+    uint32_t desc[2];
+
+    cpu_physical_memory_read(addr, desc, sizeof(desc));
+
+    desc[0] = tswap32(desc[0]);
+    desc[1] = tswap32(desc[1]);
+
+    bd->flags = extract32(desc[0], 16, 16);
+    bd->length = extract32(desc[0], 0, 16);
+    bd->data = desc[1];
 }
 
 static void mcf_fec_write_bd(mcf_fec_bd *bd, uint32_t addr)
 {
-    mcf_fec_bd tmp;
-    tmp.flags = cpu_to_be16(bd->flags);
-    tmp.length = cpu_to_be16(bd->length);
-    tmp.data = cpu_to_be32(bd->data);
-    cpu_physical_memory_write(addr, &tmp, sizeof(tmp));
+    uint32_t desc[2];
+
+    desc[0] = 0;
+    desc[0] = deposit32(desc[0], 16, 16, bd->flags);
+    desc[0] = deposit32(desc[0], 0, 16, bd->length);
+    desc[1] = bd->data;
+
+    desc[0] = tswap32(desc[0]);
+    desc[1] = tswap32(desc[1]);
+
+    cpu_physical_memory_write(addr, desc, sizeof(desc));
 }
 
 static void mcf_fec_update(mcf_fec_state *s)
@@ -136,7 +337,9 @@ static void mcf_fec_update(mcf_fec_state *s)
         mask = mcf_fec_irq_map[i];
         if (changed & mask) {
             DPRINTF("IRQ %d = %d\n", i, (active & mask) != 0);
-            qemu_set_irq(s->irq[i], (active & mask) != 0);
+            if (s->irqs != NULL) {
+                qemu_set_irq(s->irqs[i], (active & mask) != 0);
+            }
         }
     }
     s->irq_state = active;
@@ -214,6 +417,9 @@ static void mcf_fec_reset(mcf_fec_state *s)
     s->tcr = 0;
     s->tfwr = 0;
     s->rfsr = 0x500;
+    /* TODO: the i.MX53 reference manual lacks any details on these registers */
+    s->miigsk_cfgr = 0;
+    s->miigsk_enr = 0;
 }
 
 static uint64_t mcf_fec_read(void *opaque, hwaddr addr,
@@ -226,7 +432,10 @@ static uint64_t mcf_fec_read(void *opaque, hwaddr addr,
     case 0x010: return s->rx_enabled ? (1 << 24) : 0; /* RDAR */
     case 0x014: return 0; /* TDAR */
     case 0x024: return s->ecr;
-    case 0x040: return s->mmfr;
+    case 0x040:
+        s->eir &= ~FEC_INT_MII;
+        mcf_fec_update(s);
+        return s->mmfr;
     case 0x044: return s->mscr;
     case 0x064: return 0; /* MIBC */
     case 0x084: return s->rcr;
@@ -248,10 +457,37 @@ static uint64_t mcf_fec_read(void *opaque, hwaddr addr,
     case 0x180: return s->erdsr;
     case 0x184: return s->etdsr;
     case 0x188: return s->emrbr;
+    case 0x200 ... 0x2E0:
+        /* TODO: implement counters */
+        return 0;
+    case MCF_FEC_REG_MIIGSK_CFGR: return s->miigsk_cfgr;
+    case MCF_FEC_REG_MIIGSK_ENR: return s->miigsk_enr;
     default:
         hw_error("mcf_fec_read: Bad address 0x%x\n", (int)addr);
         return 0;
     }
+}
+
+static void mcf_fec_mdio_req(mcf_fec_state *s)
+{
+    unsigned int op = extract32(s->mmfr, 28, 2);
+    unsigned int phyaddr = extract32(s->mmfr, 23, 5);
+    unsigned int regaddr = extract32(s->mmfr, 18, 5);
+
+    if (op == 1) {
+        mdio_write_req(&s->mdio_bus, phyaddr, regaddr, extract32(s->mmfr, 0, 16));
+    } else if (op == 2) {
+        s->mmfr = deposit32(s->mmfr, 0, 16, mdio_read_req(&s->mdio_bus, phyaddr, regaddr));
+    } else {
+        qemu_log_mask(LOG_GUEST_ERROR, "mcf_fec_mdio_req: invalid MDIOBus OP=%d\n", op);
+    }
+
+    /*
+     * TODO: can't find any definition of when this interrupt is reset. I guess
+     * on read of MMFR
+     */
+    s->eir |= FEC_INT_MII;
+    mcf_fec_update(s);
 }
 
 static void mcf_fec_write(void *opaque, hwaddr addr,
@@ -287,12 +523,19 @@ static void mcf_fec_write(void *opaque, hwaddr addr,
         }
         break;
     case 0x040:
-        /* TODO: Implement MII.  */
         s->mmfr = value;
+        if (s->mscr & 0x7e) {
+            mcf_fec_mdio_req(s);
+        }
         break;
-    case 0x044:
+    case 0x044: {
+        int old_mii_speed = s->mscr & 0x7e;
         s->mscr = value & 0xfe;
+        if ((s->mscr & 0x7e) != 0 && old_mii_speed == 0) {
+            mcf_fec_mdio_req(s);
+        }
         break;
+    }
     case 0x064:
         /* TODO: Implement MIB.  */
         break;
@@ -344,6 +587,15 @@ static void mcf_fec_write(void *opaque, hwaddr addr,
         break;
     case 0x188:
         s->emrbr = value & 0x7f0;
+        break;
+    case MCF_FEC_REG_MIIGSK_CFGR:
+        s->miigsk_cfgr = value;
+        break;
+    case MCF_FEC_REG_MIIGSK_ENR:
+        s->miigsk_enr = value & 0x02;
+        if (s->miigsk_enr & FEC_MIIGSK_ENR_EN) {
+            s->miigsk_enr |= FEC_MIIGSK_ENR_READY;
+        }
         break;
     default:
         hw_error("mcf_fec_write Bad address 0x%x\n", (int)addr);
@@ -447,7 +699,7 @@ static NetClientInfo net_mcf_fec_info = {
 };
 
 void mcf_fec_init(MemoryRegion *sysmem, NICInfo *nd,
-                  hwaddr base, qemu_irq *irq)
+                  hwaddr base, qemu_irq *irqs)
 {
     mcf_fec_state *s;
 
@@ -455,7 +707,7 @@ void mcf_fec_init(MemoryRegion *sysmem, NICInfo *nd,
 
     s = (mcf_fec_state *)g_malloc0(sizeof(mcf_fec_state));
     s->sysmem = sysmem;
-    s->irq = irq;
+    s->irqs = irqs;
 
     memory_region_init_io(&s->iomem, NULL, &mcf_fec_ops, s, "fec", 0x400);
     memory_region_add_subregion(sysmem, base, &s->iomem);
@@ -466,4 +718,7 @@ void mcf_fec_init(MemoryRegion *sysmem, NICInfo *nd,
     s->nic = qemu_new_nic(&net_mcf_fec_info, &s->conf, nd->model, nd->name, s);
 
     qemu_format_nic_info_str(qemu_get_queue(s->nic), s->conf.macaddr.a);
+
+    tdk_init(&s->phy);
+    mdio_attach(&s->mdio_bus, &s->phy, 7);
 }

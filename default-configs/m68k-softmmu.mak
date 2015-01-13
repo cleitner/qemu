@@ -4,3 +4,4 @@ include pci.mak
 include usb.mak
 CONFIG_COLDFIRE=y
 CONFIG_PTIMER=y
+CONFIG_FEC=y
